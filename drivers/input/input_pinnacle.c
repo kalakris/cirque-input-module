@@ -245,6 +245,36 @@ static void pinnacle_report_data(const struct device *dev) {
     if (packet[0] == 0xFF || !(packet[0] & PINNACLE_STATUS1_SW_DR)) {
         return;
     }
+
+    if (config->abs_mode) {
+        struct pinnacle_data *data = dev->data;
+        uint8_t abs_packet[6];
+        ret = pinnacle_seq_read(dev, PINNACLE_2_2_PACKET0, abs_packet, 6);
+        if (ret < 0) {
+            LOG_ERR("read abs packet: %d", ret);
+            return;
+        }
+
+        LOG_HEXDUMP_DBG(abs_packet, 6, "Pinnacle abs packet");
+
+        uint16_t x = abs_packet[2] | ((uint16_t)(abs_packet[4] & 0x0F) << 8);
+        uint16_t y = abs_packet[3] | ((uint16_t)(abs_packet[4] & 0xF0) << 4);
+        uint8_t z = abs_packet[5] & 0x3F;
+
+        if (data->in_int) {
+            LOG_DBG("Clearing status bit");
+            pinnacle_clear_status(dev);
+        }
+
+        // Raw pad coordinates: X 0-2047, Y 0-1535 (Z-idle lift-off packets
+        // report all zeros). Orientation transforms are left to the consumer.
+        input_report_abs(dev, INPUT_ABS_X, x, false, K_FOREVER);
+        input_report_abs(dev, INPUT_ABS_Y, y, false, K_FOREVER);
+        input_report_abs(dev, INPUT_ABS_Z, z, true, K_FOREVER);
+
+        return;
+    }
+
     ret = pinnacle_seq_read(dev, PINNACLE_2_2_PACKET0, packet, 3);
     if (ret < 0) {
         LOG_ERR("read packet: %d", ret);
@@ -448,7 +478,9 @@ static int pinnacle_init(const struct device *dev) {
         return ret;
     }
     k_msleep(20);
-    ret = pinnacle_write(dev, PINNACLE_Z_IDLE, 0x05); // No Z-Idle packets
+    // In absolute mode a single Z-idle packet marks lift-off; in relative
+    // mode keep the original value.
+    ret = pinnacle_write(dev, PINNACLE_Z_IDLE, config->abs_mode ? 0x01 : 0x05);
     if (ret < 0) {
         LOG_ERR("can't write %d", ret);
         return ret;
@@ -508,12 +540,18 @@ static int pinnacle_init(const struct device *dev) {
         return ret;
     }
     uint8_t feed_cfg1 = PINNACLE_FEED_CFG1_EN_FEED;
-    if (config->x_invert) {
-        feed_cfg1 |= PINNACLE_FEED_CFG1_INV_X;
-    }
+    if (config->abs_mode) {
+        // Absolute mode: report raw pad coordinates; the invert/rotate feed
+        // transforms only apply to relative data, so don't request them.
+        feed_cfg1 |= PINNACLE_FEED_CFG1_ABS_MODE;
+    } else {
+        if (config->x_invert) {
+            feed_cfg1 |= PINNACLE_FEED_CFG1_INV_X;
+        }
 
-    if (config->y_invert) {
-        feed_cfg1 |= PINNACLE_FEED_CFG1_INV_Y;
+        if (config->y_invert) {
+            feed_cfg1 |= PINNACLE_FEED_CFG1_INV_Y;
+        }
     }
     if (feed_cfg1) {
         ret = pinnacle_write(dev, PINNACLE_FEED_CFG1, feed_cfg1);
@@ -576,6 +614,7 @@ static int pinnacle_pm_action(const struct device *dev, enum pm_device_action ac
         .sleep_en = DT_INST_PROP(n, sleep),                                                        \
         .no_taps = DT_INST_PROP(n, no_taps),                                                       \
         .no_secondary_tap = DT_INST_PROP(n, no_secondary_tap),                                     \
+        .abs_mode = DT_INST_PROP(n, abs_mode),                                                     \
         .x_axis_z_min = DT_INST_PROP_OR(n, x_axis_z_min, 5),                                       \
         .y_axis_z_min = DT_INST_PROP_OR(n, y_axis_z_min, 4),                                       \
         .sensitivity = DT_INST_ENUM_IDX_OR(n, sensitivity, PINNACLE_SENSITIVITY_1X),               \

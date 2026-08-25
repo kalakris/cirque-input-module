@@ -72,6 +72,12 @@
 #define PINNACLE_PACKET0_X_SIGN BIT(4)   // X delta sign
 #define PINNACLE_PACKET0_Y_SIGN BIT(5)   // Y delta sign
 
+// Absolute mode packet layout (6 bytes starting at PINNACLE_2_2_PACKET0):
+//   [0] button flags, [1] unused, [2] X low byte, [3] Y low byte,
+//   [4] low nibble: X bits 8-11, high nibble: Y bits 8-11, [5] Z (6 bits)
+#define PINNACLE_ABS_X_RANGE_MAX 2047
+#define PINNACLE_ABS_Y_RANGE_MAX 1535
+
 struct pinnacle_data {
     uint8_t btn_cache;
     bool in_int;
@@ -100,7 +106,7 @@ struct pinnacle_config {
     pinnacle_seq_read_t seq_read;
     pinnacle_write_t write;
 
-    bool rotate_90, sleep_en, no_taps, no_secondary_tap, x_invert, y_invert;
+    bool rotate_90, sleep_en, no_taps, no_secondary_tap, x_invert, y_invert, abs_mode;
     enum pinnacle_sensitivity sensitivity;
     uint8_t x_axis_z_min, y_axis_z_min;
     const struct gpio_dt_spec dr;

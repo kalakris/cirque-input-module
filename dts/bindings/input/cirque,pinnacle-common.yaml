@@ -14,6 +14,14 @@ properties:
     type: boolean
   no-taps:
     type: boolean
+  abs-mode:
+    type: boolean
+    description: |
+      Run the Pinnacle in absolute mode. Instead of relative REL_X/REL_Y
+      deltas, the driver reports INPUT_ABS_X (0-2047), INPUT_ABS_Y (0-1535)
+      and INPUT_ABS_Z (touch strength, 0 on lift-off) per sample. Hardware
+      tap gestures and the X/Y inversion / rotation feed transforms are not
+      applied in this mode; consumers get raw pad coordinates.
   sensitivity:
     type: string
     enum:
