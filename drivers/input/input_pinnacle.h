@@ -75,8 +75,6 @@
 // Absolute mode packet layout (6 bytes starting at PINNACLE_2_2_PACKET0):
 //   [0] button flags, [1] unused, [2] X low byte, [3] Y low byte,
 //   [4] low nibble: X bits 8-11, high nibble: Y bits 8-11, [5] Z (6 bits)
-#define PINNACLE_ABS_X_RANGE_MAX 2047
-#define PINNACLE_ABS_Y_RANGE_MAX 1535
 
 struct pinnacle_data {
     uint8_t btn_cache;
