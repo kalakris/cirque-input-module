@@ -22,6 +22,26 @@ properties:
       and INPUT_ABS_Z (touch strength, 0 on lift-off) per sample. Hardware
       tap gestures and the X/Y inversion / rotation feed transforms are not
       applied in this mode; consumers get raw pad coordinates.
+  stream-tap-click:
+    type: boolean
+    description: |
+      Enable firmware tap-to-click for consumers of the absolute stream
+      (ZMK's CONFIG_ZMK_TOUCH_STREAM module). Only meaningful together
+      with abs-mode, which disables the ASIC's own hardware tap
+      gestures. A touch that lifts off within stream-tap-max-ms and
+      moves at most stream-tap-max-movement raw counts is injected as a
+      button-0 click into the normal input pipeline. The driver itself
+      ignores this property.
+  stream-tap-max-ms:
+    type: int
+    default: 180
+    description: Maximum touch duration (ms) for a stream tap-to-click.
+  stream-tap-max-movement:
+    type: int
+    default: 30
+    description: |
+      Maximum movement (raw counts, per-axis Chebyshev distance from the
+      touch-down point) for a stream tap-to-click.
   sensitivity:
     type: string
     enum:
