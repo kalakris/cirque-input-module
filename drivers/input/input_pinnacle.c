@@ -478,9 +478,13 @@ static int pinnacle_init(const struct device *dev) {
         return ret;
     }
     k_msleep(20);
-    // In absolute mode a single Z-idle packet marks lift-off; in relative
-    // mode keep the original value.
-    ret = pinnacle_write(dev, PINNACLE_Z_IDLE, config->abs_mode ? 0x01 : 0x05);
+    // In absolute mode a burst of Z-idle (all-zero) packets marks lift-off.
+    // Use 3 packets for redundancy: packets are occasionally dropped (e.g.
+    // the STATUS1 == 0xFF glitch guard in pinnacle_report_data), and losing
+    // the only lift-off packet would leave consumers stuck in a touching
+    // state. Consumers dedup repeated Z-idle frames, so the extras are
+    // free. In relative mode keep the original value.
+    ret = pinnacle_write(dev, PINNACLE_Z_IDLE, config->abs_mode ? 0x03 : 0x05);
     if (ret < 0) {
         LOG_ERR("can't write %d", ret);
         return ret;
