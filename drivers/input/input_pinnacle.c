@@ -1,632 +1,910 @@
+/*
+ * Copyright (c) 2024 Ilia Kharin
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #define DT_DRV_COMPAT cirque_pinnacle
 
-#include <zephyr/dt-bindings/input/input-event-codes.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/gpio.h>
+#if DT_ANY_INST_ON_BUS_STATUS_OKAY(i2c)
+#include <zephyr/drivers/i2c.h>
+#endif
+#if DT_ANY_INST_ON_BUS_STATUS_OKAY(spi)
+#include <zephyr/drivers/spi.h>
+#endif
 #include <zephyr/init.h>
 #include <zephyr/input/input.h>
-#include <zephyr/pm/device.h>
-
+#include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
-
-#include "input_pinnacle.h"
+#include <zephyr/sys/util.h>
 
 LOG_MODULE_REGISTER(pinnacle, CONFIG_INPUT_LOG_LEVEL);
 
-static int pinnacle_seq_read(const struct device *dev, const uint8_t addr, uint8_t *buf,
-                             const uint8_t len) {
-    const struct pinnacle_config *config = dev->config;
-    return config->seq_read(dev, addr, buf, len);
+/*
+ * Register Access Protocol Standard Registers.
+ * Standard registers have 5-bit addresses, BIT[4:0], that range from
+ * 0x00 to 0x1F. For reading, a register address has to be combined with
+ * 0xA0 for reading and 0x80 for writing bits, BIT[7:5].
+ */
+#define PINNACLE_REG_FIRMWARE_ID      0x00 /* R */
+#define PINNACLE_REG_FIRMWARE_VERSION 0x01 /* R */
+#define PINNACLE_REG_STATUS1          0x02 /* R/W */
+#define PINNACLE_REG_SYS_CONFIG1      0x03 /* R/W */
+#define PINNACLE_REG_FEED_CONFIG1     0x04 /* R/W */
+#define PINNACLE_REG_FEED_CONFIG2     0x05 /* R/W */
+#define PINNACLE_REG_FEED_CONFIG3     0x06 /* R/W */
+#define PINNACLE_REG_CAL_CONFIG1      0x07 /* R/W */
+#define PINNACLE_REG_PS2_AUX_CONTROL  0x08 /* R/W */
+#define PINNACLE_REG_SAMPLE_RATE      0x09 /* R/W */
+#define PINNACLE_REG_Z_IDLE           0x0A /* R/W */
+#define PINNACLE_REG_Z_SCALER         0x0B /* R/W */
+#define PINNACLE_REG_SLEEP_INTERVAL   0x0C /* R/W */
+#define PINNACLE_REG_SLEEP_TIMER      0x0D /* R/W */
+#define PINNACLE_REG_EMI_THRESHOLD    0x0E /* R/W */
+#define PINNACLE_REG_PACKET_BYTE0     0x12 /* R */
+#define PINNACLE_REG_PACKET_BYTE1     0x13 /* R */
+#define PINNACLE_REG_PACKET_BYTE2     0x14 /* R */
+#define PINNACLE_REG_PACKET_BYTE3     0x15 /* R */
+#define PINNACLE_REG_PACKET_BYTE4     0x16 /* R */
+#define PINNACLE_REG_PACKET_BYTE5     0x17 /* R */
+#define PINNACLE_REG_GPIO_A_CTRL      0x18 /* R/W */
+#define PINNACLE_REG_GPIO_A_DATA      0x19 /* R/W */
+#define PINNACLE_REG_GPIO_B_CTRL_DATA 0x1A /* R/W */
+/* Value of the extended register */
+#define PINNACLE_REG_ERA_VALUE        0x1B /* R/W */
+/* High byte BIT[15:8] of the 16 bit extended register */
+#define PINNACLE_REG_ERA_ADDR_HIGH    0x1C /* R/W */
+/* Low byte BIT[7:0] of the 16 bit extended register */
+#define PINNACLE_REG_ERA_ADDR_LOW     0x1D /* R/W */
+#define PINNACLE_REG_ERA_CTRL         0x1E /* R/W */
+#define PINNACLE_REG_PRODUCT_ID       0x1F /* R */
+
+/* Extended Register Access */
+#define PINNACLE_ERA_REG_CONFIG 0x0187 /* R/W */
+
+/* Firmware ASIC ID value */
+#define PINNACLE_FIRMWARE_ID 0x07
+
+/* Status1 definition */
+#define PINNACLE_STATUS1_SW_DR BIT(2)
+#define PINNACLE_STATUS1_SW_CC BIT(3)
+
+/* SysConfig1 definition */
+#define PINNACLE_SYS_CONFIG1_RESET          BIT(0)
+#define PINNACLE_SYS_CONFIG1_SHUTDOWN       BIT(1)
+#define PINNACLE_SYS_CONFIG1_LOW_POWER_MODE BIT(2)
+
+/* FeedConfig1 definition */
+#define PINNACLE_FEED_CONFIG1_FEED_ENABLE        BIT(0)
+#define PINNACLE_FEED_CONFIG1_DATA_MODE_ABSOLUTE BIT(1)
+#define PINNACLE_FEED_CONFIG1_FILTER_DISABLE     BIT(2)
+#define PINNACLE_FEED_CONFIG1_X_DISABLE          BIT(3)
+#define PINNACLE_FEED_CONFIG1_Y_DISABLE          BIT(4)
+#define PINNACLE_FEED_CONFIG1_X_INVERT           BIT(6)
+#define PINNACLE_FEED_CONFIG1_Y_INVERT           BIT(7)
+/* X max to 0 */
+#define PINNACLE_FEED_CONFIG1_X_DATA_INVERT      BIT(6)
+/* Y max to 0 */
+#define PINNACLE_FEED_CONFIG1_Y_DATA_INVERT      BIT(7)
+
+/* FeedConfig2 definition */
+#define PINNACLE_FEED_CONFIG2_INTELLIMOUSE_ENABLE   BIT(0)
+#define PINNACLE_FEED_CONFIG2_ALL_TAPS_DISABLE      BIT(1)
+#define PINNACLE_FEED_CONFIG2_SECONDARY_TAP_DISABLE BIT(2)
+#define PINNACLE_FEED_CONFIG2_SCROLL_DISABLE        BIT(3)
+#define PINNACLE_FEED_CONFIG2_GLIDE_EXTEND_DISABLE  BIT(4)
+/* 90 degrees rotation */
+#define PINNACLE_FEED_CONFIG2_SWAP_X_AND_Y          BIT(7)
+
+/* Relative position status in PacketByte0 */
+#define PINNACLE_PACKET_BYTE0_BTN_PRIMARY  BIT(0)
+#define PINNACLE_PACKET_BYTE0_BTN_SECONDRY BIT(1)
+
+/* Extended Register Access Control */
+#define PINNACLE_ERA_CTRL_READ           BIT(0)
+#define PINNACLE_ERA_CTRL_WRITE          BIT(1)
+#define PINNACLE_ERA_CTRL_READ_AUTO_INC  BIT(2)
+#define PINNACLE_ERA_CTRL_WRITE_AUTO_INC BIT(3)
+/* Asserting both BIT(1) and BIT(0) means WRITE/Verify */
+#define PINNACLE_ERA_CTRL_WRITE_VERIFY   (BIT(1) | BIT(0))
+#define PINNACLE_ERA_CTRL_COMPLETE       0x00
+
+/* Extended Register Access Config */
+#define PINNACLE_ERA_CONFIG_ADC_ATTENUATION_X1 0x00
+#define PINNACLE_ERA_CONFIG_ADC_ATTENUATION_X2 0x40
+#define PINNACLE_ERA_CONFIG_ADC_ATTENUATION_X3 0x80
+#define PINNACLE_ERA_CONFIG_ADC_ATTENUATION_X4 0xC0
+
+/*
+ * Delay and retry count for waiting completion of calibration with 200 ms of
+ * timeout.
+ */
+#define PINNACLE_CALIBRATION_AWAIT_DELAY_POLL_US 50000
+#define PINNACLE_CALIBRATION_AWAIT_RETRY_COUNT   4
+
+/*
+ * Delay and retry count for waiting completion of ERA command with 50 ms of
+ * timeout.
+ */
+#define PINNACLE_ERA_AWAIT_DELAY_POLL_US 10000
+#define PINNACLE_ERA_AWAIT_RETRY_COUNT   5
+
+/* Special definitions */
+#define PINNACLE_SPI_FB 0xFB /* Filler byte */
+#define PINNACLE_SPI_FC 0xFC /* Auto-increment byte */
+
+/* Read and write masks */
+#define PINNACLE_READ_MSK  0xA0
+#define PINNACLE_WRITE_MSK 0x80
+
+/* Read and write register addresses */
+#define PINNACLE_READ_REG(addr)  (PINNACLE_READ_MSK | addr)
+#define PINNACLE_WRITE_REG(addr) (PINNACLE_WRITE_MSK | addr)
+
+struct pinnacle_bus {
+	union {
+#if DT_ANY_INST_ON_BUS_STATUS_OKAY(i2c)
+		struct i2c_dt_spec i2c;
+#endif
+#if DT_ANY_INST_ON_BUS_STATUS_OKAY(spi)
+		struct spi_dt_spec spi;
+#endif
+	};
+	bool (*is_ready)(const struct pinnacle_bus *bus);
+	int (*write)(const struct pinnacle_bus *bus, uint8_t address, uint8_t value);
+	int (*seq_write)(const struct pinnacle_bus *bus, uint8_t *address, uint8_t *value,
+			 uint8_t count);
+	int (*read)(const struct pinnacle_bus *bus, uint8_t address, uint8_t *value);
+	int (*seq_read)(const struct pinnacle_bus *bus, uint8_t address, uint8_t *data,
+			uint8_t count);
+};
+
+enum pinnacle_sensitivity {
+	PINNACLE_SENSITIVITY_X1,
+	PINNACLE_SENSITIVITY_X2,
+	PINNACLE_SENSITIVITY_X3,
+	PINNACLE_SENSITIVITY_X4,
+};
+
+struct pinnacle_config {
+	const struct pinnacle_bus bus;
+	struct gpio_dt_spec dr_gpio;
+
+	enum pinnacle_sensitivity sensitivity;
+	bool relative_mode;
+	uint8_t idle_packets_count;
+
+	bool clipping_enabled;
+	bool scaling_enabled;
+	bool invert_x;
+	bool invert_y;
+	bool primary_tap_enabled;
+	bool swap_xy;
+
+	uint16_t active_range_x_min;
+	uint16_t active_range_x_max;
+	uint16_t active_range_y_min;
+	uint16_t active_range_y_max;
+
+	uint16_t resolution_x;
+	uint16_t resolution_y;
+};
+
+union pinnacle_sample {
+	struct {
+		uint16_t abs_x;
+		uint16_t abs_y;
+		uint8_t abs_z;
+	};
+	struct {
+		int16_t rel_x;
+		int16_t rel_y;
+		bool btn_primary;
+	};
+};
+
+struct pinnacle_data {
+	union pinnacle_sample sample;
+	const struct device *dev;
+	struct gpio_callback dr_cb_data;
+	struct k_work work;
+};
+
+static inline bool pinnacle_bus_is_ready(const struct device *dev)
+{
+	const struct pinnacle_config *config = dev->config;
+
+	return config->bus.is_ready(&config->bus);
 }
-static int pinnacle_write(const struct device *dev, const uint8_t addr, const uint8_t val) {
-    const struct pinnacle_config *config = dev->config;
-    return config->write(dev, addr, val);
+
+static inline int pinnacle_write(const struct device *dev, uint8_t address, uint8_t value)
+{
+	const struct pinnacle_config *config = dev->config;
+
+	return config->bus.write(&config->bus, address, value);
+}
+static inline int pinnacle_seq_write(const struct device *dev, uint8_t *address, uint8_t *value,
+				     uint8_t count)
+{
+	const struct pinnacle_config *config = dev->config;
+
+	return config->bus.seq_write(&config->bus, address, value, count);
+}
+static inline int pinnacle_read(const struct device *dev, uint8_t address, uint8_t *value)
+{
+	const struct pinnacle_config *config = dev->config;
+
+	return config->bus.read(&config->bus, address, value);
+}
+
+static inline int pinnacle_seq_read(const struct device *dev, uint8_t address, uint8_t *data,
+				    uint8_t count)
+{
+	const struct pinnacle_config *config = dev->config;
+
+	return config->bus.seq_read(&config->bus, address, data, count);
+}
+
+static inline int pinnacle_clear_cmd_complete(const struct device *dev)
+{
+	const struct pinnacle_config *config = dev->config;
+
+	return config->bus.write(&config->bus, PINNACLE_REG_STATUS1, 0x00);
+}
+
+static int pinnacle_era_wait_for_completion(const struct device *dev)
+{
+	bool ret;
+	uint8_t value;
+
+	ret = WAIT_FOR(pinnacle_read(dev, PINNACLE_REG_ERA_CTRL, &value) == 0 &&
+		       value == PINNACLE_ERA_CTRL_COMPLETE,
+		       PINNACLE_ERA_AWAIT_RETRY_COUNT * PINNACLE_ERA_AWAIT_DELAY_POLL_US,
+		       k_sleep(K_USEC(PINNACLE_ERA_AWAIT_DELAY_POLL_US)));
+	if (!ret) {
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static int pinnacle_era_write(const struct device *dev, uint16_t address, uint8_t value)
+{
+	uint8_t address_buf[] = {
+		PINNACLE_REG_ERA_VALUE,
+		PINNACLE_REG_ERA_ADDR_HIGH,
+		PINNACLE_REG_ERA_ADDR_LOW,
+		PINNACLE_REG_ERA_CTRL,
+	};
+	uint8_t value_buf[] = {
+		value,
+		address >> 8,
+		address & 0xFF,
+		PINNACLE_ERA_CTRL_WRITE,
+	};
+	int rc;
+
+	rc = pinnacle_seq_write(dev, address_buf, value_buf, sizeof(address_buf));
+	if (rc) {
+		return rc;
+	}
+
+	return pinnacle_era_wait_for_completion(dev);
+}
+
+static int pinnacle_era_read(const struct device *dev, uint16_t address, uint8_t *value)
+{
+	uint8_t address_buf[] = {
+		PINNACLE_REG_ERA_ADDR_HIGH,
+		PINNACLE_REG_ERA_ADDR_LOW,
+		PINNACLE_REG_ERA_CTRL,
+	};
+	uint8_t value_buf[] = {
+		address >> 8,
+		address & 0xFF,
+		PINNACLE_ERA_CTRL_READ,
+	};
+	int rc;
+
+	rc = pinnacle_seq_write(dev, address_buf, value_buf, sizeof(address_buf));
+	if (rc) {
+		return rc;
+	}
+
+	rc = pinnacle_era_wait_for_completion(dev);
+	if (rc) {
+		return rc;
+	}
+
+	return pinnacle_read(dev, PINNACLE_REG_ERA_VALUE, value);
+}
+
+static int pinnacle_set_sensitivity(const struct device *dev)
+{
+	const struct pinnacle_config *config = dev->config;
+
+	uint8_t value;
+	int rc;
+
+	rc = pinnacle_era_read(dev, PINNACLE_ERA_REG_CONFIG, &value);
+	if (rc) {
+		return rc;
+	}
+
+	/* Clear BIT(7) and BIT(6) */
+	value &= 0x3F;
+
+	switch (config->sensitivity) {
+	case PINNACLE_SENSITIVITY_X1:
+		value |= PINNACLE_ERA_CONFIG_ADC_ATTENUATION_X1;
+		break;
+	case PINNACLE_SENSITIVITY_X2:
+		value |= PINNACLE_ERA_CONFIG_ADC_ATTENUATION_X2;
+		break;
+	case PINNACLE_SENSITIVITY_X3:
+		value |= PINNACLE_ERA_CONFIG_ADC_ATTENUATION_X3;
+		break;
+	case PINNACLE_SENSITIVITY_X4:
+		value |= PINNACLE_ERA_CONFIG_ADC_ATTENUATION_X4;
+		break;
+	}
+
+	rc = pinnacle_era_write(dev, PINNACLE_ERA_REG_CONFIG, value);
+	if (rc) {
+		return rc;
+	}
+
+	/* Clear SW_CC after setting sensitivity */
+	rc = pinnacle_clear_cmd_complete(dev);
+	if (rc) {
+		return rc;
+	}
+
+	return 0;
 }
 
 #if DT_ANY_INST_ON_BUS_STATUS_OKAY(i2c)
+static bool pinnacle_is_ready_i2c(const struct pinnacle_bus *bus)
+{
+	if (!i2c_is_ready_dt(&bus->i2c)) {
+		LOG_ERR("I2C bus %s is not ready", bus->i2c.bus->name);
+		return false;
+	}
 
-static int pinnacle_i2c_seq_read(const struct device *dev, const uint8_t addr, uint8_t *buf,
-                                 const uint8_t len) {
-    const struct pinnacle_config *config = dev->config;
-    return i2c_burst_read_dt(&config->bus.i2c, PINNACLE_READ | addr, buf, len);
+	return true;
 }
 
-static int pinnacle_i2c_write(const struct device *dev, const uint8_t addr, const uint8_t val) {
-    const struct pinnacle_config *config = dev->config;
-    return i2c_reg_write_byte_dt(&config->bus.i2c, PINNACLE_WRITE | addr, val);
+static int pinnacle_write_i2c(const struct pinnacle_bus *bus, uint8_t address, uint8_t value)
+{
+	uint8_t buf[] = {PINNACLE_WRITE_REG(address), value};
+
+	return i2c_write_dt(&bus->i2c, buf, 2);
 }
 
-#endif // DT_ANY_INST_ON_BUS_STATUS_OKAY(i2c)
+static int pinnacle_seq_write_i2c(const struct pinnacle_bus *bus, uint8_t *address, uint8_t *value,
+				  uint8_t count)
+{
+	uint8_t buf[count * 2];
+
+	for (uint8_t i = 0; i < count; ++i) {
+		buf[i * 2] = PINNACLE_WRITE_REG(address[i]);
+		buf[i * 2 + 1] = value[i];
+	}
+
+	return i2c_write_dt(&bus->i2c, buf, count * 2);
+}
+
+static int pinnacle_read_i2c(const struct pinnacle_bus *bus, uint8_t address, uint8_t *value)
+{
+	uint8_t reg = PINNACLE_READ_REG(address);
+
+	return i2c_write_read_dt(&bus->i2c, &reg, 1, value, 1);
+}
+
+static int pinnacle_seq_read_i2c(const struct pinnacle_bus *bus, uint8_t address, uint8_t *buf,
+				 uint8_t count)
+{
+	uint8_t reg = PINNACLE_READ_REG(address);
+
+	return i2c_burst_read_dt(&bus->i2c, reg, buf, count);
+}
+#endif /* DT_ANY_INST_ON_BUS_STATUS_OKAY(i2c) */
 
 #if DT_ANY_INST_ON_BUS_STATUS_OKAY(spi)
+static bool pinnacle_is_ready_spi(const struct pinnacle_bus *bus)
+{
+	if (!spi_is_ready_dt(&bus->spi)) {
+		LOG_ERR("SPI bus %s is not ready", bus->spi.bus->name);
+		return false;
+	}
 
-static int pinnacle_spi_seq_read(const struct device *dev, const uint8_t addr, uint8_t *buf,
-                                 const uint8_t len) {
-    const struct pinnacle_config *config = dev->config;
-    uint8_t tx_buffer[len + 3], rx_dummy[3];
-    tx_buffer[0] = PINNACLE_READ | addr;
-    memset(&tx_buffer[1], PINNACLE_AUTOINC, len + 2);
-
-    const struct spi_buf tx_buf[2] = {
-        {
-            .buf = tx_buffer,
-            .len = len + 3,
-        },
-    };
-    const struct spi_buf_set tx = {
-        .buffers = tx_buf,
-        .count = 1,
-    };
-    struct spi_buf rx_buf[2] = {
-        {
-            .buf = rx_dummy,
-            .len = 3,
-        },
-        {
-            .buf = buf,
-            .len = len,
-        },
-    };
-    const struct spi_buf_set rx = {
-        .buffers = rx_buf,
-        .count = 2,
-    };
-    int ret = spi_transceive_dt(&config->bus.spi, &tx, &rx);
-
-    return ret;
+	return true;
 }
 
-static int pinnacle_spi_write(const struct device *dev, const uint8_t addr, const uint8_t val) {
-    const struct pinnacle_config *config = dev->config;
-    uint8_t tx_buffer[2] = {PINNACLE_WRITE | addr, val};
-    uint8_t rx_buffer[2];
+static int pinnacle_write_spi(const struct pinnacle_bus *bus, uint8_t address, uint8_t value)
+{
+	uint8_t tx_data[] = {
+		PINNACLE_WRITE_REG(address),
+		value,
+	};
+	const struct spi_buf tx_buf[] = {{
+		.buf = tx_data,
+		.len = sizeof(tx_data),
+	}};
+	const struct spi_buf_set tx_set = {
+		.buffers = tx_buf,
+		.count = ARRAY_SIZE(tx_buf),
+	};
 
-    const struct spi_buf tx_buf = {
-        .buf = tx_buffer,
-        .len = 2,
-    };
-    const struct spi_buf_set tx = {
-        .buffers = &tx_buf,
-        .count = 1,
-    };
-
-    const struct spi_buf rx_buf = {
-        .buf = rx_buffer,
-        .len = 2,
-    };
-    const struct spi_buf_set rx = {
-        .buffers = &rx_buf,
-        .count = 1,
-    };
-
-    const int ret = spi_transceive_dt(&config->bus.spi, &tx, &rx);
-
-    if (ret < 0) {
-        LOG_ERR("spi ret: %d", ret);
-    }
-
-    if (rx_buffer[1] != PINNACLE_FILLER) {
-        LOG_ERR("bad ret val %d - %d", rx_buffer[0], rx_buffer[1]);
-        return -EIO;
-    }
-
-    k_usleep(50);
-
-    return ret;
-}
-#endif // DT_ANY_INST_ON_BUS_STATUS_OKAY(spi)
-
-static int set_int(const struct device *dev, const bool en) {
-    const struct pinnacle_config *config = dev->config;
-    int ret = gpio_pin_interrupt_configure_dt(&config->dr,
-                                              en ? GPIO_INT_EDGE_TO_ACTIVE : GPIO_INT_DISABLE);
-    if (ret < 0) {
-        LOG_ERR("can't set interrupt");
-    }
-
-    return ret;
+	return spi_write_dt(&bus->spi, &tx_set);
 }
 
-static int pinnacle_clear_status(const struct device *dev) {
-    int ret = pinnacle_write(dev, PINNACLE_STATUS1, 0);
-    if (ret < 0) {
-        LOG_ERR("Failed to clear STATUS1 register: %d", ret);
-    }
+static int pinnacle_seq_write_spi(const struct pinnacle_bus *bus, uint8_t *address, uint8_t *value,
+				  uint8_t count)
+{
+	uint8_t tx_data[count * 2];
+	const struct spi_buf tx_buf[] = {{
+		.buf = tx_data,
+		.len = sizeof(tx_data),
+	}};
+	const struct spi_buf_set tx_set = {
+		.buffers = tx_buf,
+		.count = ARRAY_SIZE(tx_buf),
+	};
 
-    return ret;
+	for (uint8_t i = 0; i < count; ++i) {
+		tx_data[i * 2] = PINNACLE_WRITE_REG(address[i]);
+		tx_data[i * 2 + 1] = value[i];
+	}
+
+	return spi_write_dt(&bus->spi, &tx_set);
 }
 
-static int pinnacle_era_read(const struct device *dev, const uint16_t addr, uint8_t *val) {
-    int ret;
+static int pinnacle_read_spi(const struct pinnacle_bus *bus, uint8_t address, uint8_t *value)
+{
+	uint8_t tx_data[] = {
+		PINNACLE_READ_REG(address),
+		PINNACLE_SPI_FB,
+		PINNACLE_SPI_FB,
+		PINNACLE_SPI_FB,
+	};
+	const struct spi_buf tx_buf[] = {{
+		.buf = tx_data,
+		.len = sizeof(tx_data),
+	}};
+	const struct spi_buf_set tx_set = {
+		.buffers = tx_buf,
+		.count = ARRAY_SIZE(tx_buf),
+	};
 
-    set_int(dev, false);
+	const struct spi_buf rx_buf[] = {
+		{
+			.buf = NULL,
+			.len = 3,
+		},
+		{
+			.buf = value,
+			.len = 1,
+		},
+	};
+	const struct spi_buf_set rx_set = {
+		.buffers = rx_buf,
+		.count = ARRAY_SIZE(rx_buf),
+	};
 
-    ret = pinnacle_write(dev, PINNACLE_REG_ERA_HIGH_BYTE, (uint8_t)(addr >> 8));
-    if (ret < 0) {
-        LOG_ERR("Failed to write ERA high byte (%d)", ret);
-        return -EIO;
-    }
+	int rc;
 
-    ret = pinnacle_write(dev, PINNACLE_REG_ERA_LOW_BYTE, (uint8_t)(addr & 0x00FF));
-    if (ret < 0) {
-        LOG_ERR("Failed to write ERA low byte (%d)", ret);
-        return -EIO;
-    }
+	rc = spi_transceive_dt(&bus->spi, &tx_set, &rx_set);
+	if (rc) {
+		LOG_ERR("Failed to read from SPI %s", bus->spi.bus->name);
+		return rc;
+	}
 
-    ret = pinnacle_write(dev, PINNACLE_REG_ERA_CONTROL, PINNACLE_ERA_CONTROL_READ);
-    if (ret < 0) {
-        LOG_ERR("Failed to write ERA control (%d)", ret);
-        return -EIO;
-    }
-
-    uint8_t control_val;
-    do {
-
-        ret = pinnacle_seq_read(dev, PINNACLE_REG_ERA_CONTROL, &control_val, 1);
-        if (ret < 0) {
-            LOG_ERR("Failed to read ERA control (%d)", ret);
-            return -EIO;
-        }
-
-    } while (control_val != 0x00);
-
-    ret = pinnacle_seq_read(dev, PINNACLE_REG_ERA_VALUE, val, 1);
-
-    if (ret < 0) {
-        LOG_ERR("Failed to read ERA value (%d)", ret);
-        return -EIO;
-    }
-
-    ret = pinnacle_clear_status(dev);
-
-    set_int(dev, true);
-
-    return ret;
+	return 0;
 }
 
-static int pinnacle_era_write(const struct device *dev, const uint16_t addr, uint8_t val) {
-    int ret;
+static int pinnacle_seq_read_spi(const struct pinnacle_bus *bus, uint8_t address, uint8_t *buf,
+				 uint8_t count)
+{
 
-    set_int(dev, false);
+	uint8_t size = count + 3;
+	uint8_t tx_data[size];
 
-    ret = pinnacle_write(dev, PINNACLE_REG_ERA_VALUE, val);
-    if (ret < 0) {
-        LOG_ERR("Failed to write ERA value (%d)", ret);
-        return -EIO;
-    }
+	tx_data[0] = PINNACLE_READ_REG(address);
+	tx_data[1] = PINNACLE_SPI_FC;
+	tx_data[2] = PINNACLE_SPI_FC;
 
-    ret = pinnacle_write(dev, PINNACLE_REG_ERA_HIGH_BYTE, (uint8_t)(addr >> 8));
-    if (ret < 0) {
-        LOG_ERR("Failed to write ERA high byte (%d)", ret);
-        return -EIO;
-    }
+	uint8_t i = 3;
 
-    ret = pinnacle_write(dev, PINNACLE_REG_ERA_LOW_BYTE, (uint8_t)(addr & 0x00FF));
-    if (ret < 0) {
-        LOG_ERR("Failed to write ERA low byte (%d)", ret);
-        return -EIO;
-    }
+	for (; i < (count + 2); ++i) {
+		tx_data[i] = PINNACLE_SPI_FC;
+	}
 
-    ret = pinnacle_write(dev, PINNACLE_REG_ERA_CONTROL, PINNACLE_ERA_CONTROL_WRITE);
-    if (ret < 0) {
-        LOG_ERR("Failed to write ERA control (%d)", ret);
-        return -EIO;
-    }
+	tx_data[i++] = PINNACLE_SPI_FB;
 
-    uint8_t control_val;
-    do {
+	const struct spi_buf tx_buf[] = {{
+		.buf = tx_data,
+		.len = size,
+	}};
+	const struct spi_buf_set tx_set = {
+		.buffers = tx_buf,
+		.count = 1,
+	};
 
-        ret = pinnacle_seq_read(dev, PINNACLE_REG_ERA_CONTROL, &control_val, 1);
-        if (ret < 0) {
-            LOG_ERR("Failed to read ERA control (%d)", ret);
-            return -EIO;
-        }
+	const struct spi_buf rx_buf[] = {
+		{
+			.buf = NULL,
+			.len = 3,
+		},
+		{
+			.buf = buf,
+			.len = count,
+		},
+	};
+	const struct spi_buf_set rx_set = {
+		.buffers = rx_buf,
+		.count = ARRAY_SIZE(rx_buf),
+	};
 
-    } while (control_val != 0x00);
+	int rc;
 
-    ret = pinnacle_clear_status(dev);
+	rc = spi_transceive_dt(&bus->spi, &tx_set, &rx_set);
+	if (rc) {
+		LOG_ERR("Failed to read from SPI %s", bus->spi.bus->name);
+		return rc;
+	}
 
-    set_int(dev, true);
+	return 0;
+}
+#endif /* DT_ANY_INST_ON_BUS_STATUS_OKAY(spi) */
 
-    return ret;
+static void pinnacle_decode_sample(const struct device *dev, uint8_t *rx,
+				   union pinnacle_sample *sample)
+{
+	const struct pinnacle_config *config = dev->config;
+
+	if (config->relative_mode) {
+		if (config->primary_tap_enabled) {
+			sample->btn_primary = (rx[0] & BIT(0)) == BIT(0);
+		}
+		sample->rel_x = ((rx[0] & BIT(4)) == BIT(4)) ? -(256 - rx[1]) : rx[1];
+		sample->rel_y = ((rx[0] & BIT(5)) == BIT(5)) ? -(256 - rx[2]) : rx[2];
+	} else {
+		sample->abs_x = ((rx[2] & 0x0F) << 8) | rx[0];
+		sample->abs_y = ((rx[2] & 0xF0) << 4) | rx[1];
+		sample->abs_z = rx[3] & 0x3F;
+	}
 }
 
-static void pinnacle_report_data(const struct device *dev) {
-    const struct pinnacle_config *config = dev->config;
-    uint8_t packet[3];
-    int ret;
-    ret = pinnacle_seq_read(dev, PINNACLE_STATUS1, packet, 1);
-    if (ret < 0) {
-        LOG_ERR("read status: %d", ret);
-        return;
-    }
-
-    LOG_HEXDUMP_DBG(packet, 1, "Pinnacle Status1");
-
-    // Ignore 0xFF packets that indicate communcation failure, or if SW_DR isn't asserted
-    if (packet[0] == 0xFF || !(packet[0] & PINNACLE_STATUS1_SW_DR)) {
-        return;
-    }
-
-    if (config->abs_mode) {
-        struct pinnacle_data *data = dev->data;
-        uint8_t abs_packet[6];
-        ret = pinnacle_seq_read(dev, PINNACLE_2_2_PACKET0, abs_packet, 6);
-        if (ret < 0) {
-            LOG_ERR("read abs packet: %d", ret);
-            return;
-        }
-
-        LOG_HEXDUMP_DBG(abs_packet, 6, "Pinnacle abs packet");
-
-        uint16_t x = abs_packet[2] | ((uint16_t)(abs_packet[4] & 0x0F) << 8);
-        uint16_t y = abs_packet[3] | ((uint16_t)(abs_packet[4] & 0xF0) << 4);
-        uint8_t z = abs_packet[5] & 0x3F;
-
-        if (data->in_int) {
-            LOG_DBG("Clearing status bit");
-            pinnacle_clear_status(dev);
-        }
-
-        // Raw pad coordinates: X 0-2047, Y 0-1535 (Z-idle lift-off packets
-        // report all zeros). Orientation transforms are left to the consumer.
-        input_report_abs(dev, INPUT_ABS_X, x, false, K_FOREVER);
-        input_report_abs(dev, INPUT_ABS_Y, y, false, K_FOREVER);
-        input_report_abs(dev, INPUT_ABS_Z, z, true, K_FOREVER);
-
-        return;
-    }
-
-    ret = pinnacle_seq_read(dev, PINNACLE_2_2_PACKET0, packet, 3);
-    if (ret < 0) {
-        LOG_ERR("read packet: %d", ret);
-        return;
-    }
-
-    LOG_HEXDUMP_DBG(packet, 3, "Pinnacle Packets");
-
-    struct pinnacle_data *data = dev->data;
-    uint8_t btn = packet[0] &
-                  (PINNACLE_PACKET0_BTN_PRIM | PINNACLE_PACKET0_BTN_SEC | PINNACLE_PACKET0_BTN_AUX);
-
-    int8_t dx = (int8_t)packet[1];
-    int8_t dy = (int8_t)packet[2];
-
-    if (packet[0] & PINNACLE_PACKET0_X_SIGN) {
-        WRITE_BIT(dx, 7, 1);
-    }
-    if (packet[0] & PINNACLE_PACKET0_Y_SIGN) {
-        WRITE_BIT(dy, 7, 1);
-    }
-
-    if (data->in_int) {
-        LOG_DBG("Clearing status bit");
-        ret = pinnacle_clear_status(dev);
-        data->in_int = true;
-    }
-
-    if (!config->no_taps && (btn || data->btn_cache)) {
-        for (int i = 0; i < 3; i++) {
-            uint8_t btn_val = btn & BIT(i);
-            if (btn_val != (data->btn_cache & BIT(i))) {
-                input_report_key(dev, INPUT_BTN_0 + i, btn_val ? 1 : 0, false, K_FOREVER);
-            }
-        }
-    }
-
-    data->btn_cache = btn;
-
-    input_report_rel(dev, INPUT_REL_X, dx, false, K_FOREVER);
-    input_report_rel(dev, INPUT_REL_Y, dy, true, K_FOREVER);
-
-    return;
+static bool pinnacle_is_idle_sample(const union pinnacle_sample *sample)
+{
+	return (sample->abs_x == 0 && sample->abs_y == 0 && sample->abs_z == 0);
 }
 
-static void pinnacle_work_cb(struct k_work *work) {
-    struct pinnacle_data *data = CONTAINER_OF(work, struct pinnacle_data, work);
-    pinnacle_report_data(data->dev);
+static void pinnacle_clip_sample(const struct device *dev, union pinnacle_sample *sample)
+{
+	const struct pinnacle_config *config = dev->config;
+
+	if (sample->abs_x < config->active_range_x_min) {
+		sample->abs_x = config->active_range_x_min;
+	}
+	if (sample->abs_x > config->active_range_x_max) {
+		sample->abs_x = config->active_range_x_max;
+	}
+	if (sample->abs_y < config->active_range_y_min) {
+		sample->abs_y = config->active_range_y_min;
+	}
+	if (sample->abs_y > config->active_range_y_max) {
+		sample->abs_y = config->active_range_y_max;
+	}
 }
 
-static void pinnacle_gpio_cb(const struct device *port, struct gpio_callback *cb, uint32_t pins) {
-    struct pinnacle_data *data = CONTAINER_OF(cb, struct pinnacle_data, gpio_cb);
+static void pinnacle_scale_sample(const struct device *dev, union pinnacle_sample *sample)
+{
+	const struct pinnacle_config *config = dev->config;
 
-    LOG_DBG("HW DR asserted");
-    data->in_int = true;
-    k_work_submit(&data->work);
+	uint16_t range_x = config->active_range_x_max - config->active_range_x_min;
+	uint16_t range_y = config->active_range_y_max - config->active_range_y_min;
+
+	sample->abs_x = (uint16_t)((uint32_t)(sample->abs_x - config->active_range_x_min) *
+				   config->resolution_x / range_x);
+	sample->abs_y = (uint16_t)((uint32_t)(sample->abs_y - config->active_range_y_min) *
+				   config->resolution_y / range_y);
 }
 
-static int pinnacle_adc_sensitivity_reg_value(enum pinnacle_sensitivity sensitivity) {
-    switch (sensitivity) {
-    case PINNACLE_SENSITIVITY_1X:
-        return PINNACLE_TRACKING_ADC_CONFIG_1X;
-    case PINNACLE_SENSITIVITY_2X:
-        return PINNACLE_TRACKING_ADC_CONFIG_2X;
-    case PINNACLE_SENSITIVITY_3X:
-        return PINNACLE_TRACKING_ADC_CONFIG_3X;
-    case PINNACLE_SENSITIVITY_4X:
-        return PINNACLE_TRACKING_ADC_CONFIG_4X;
-    default:
-        return PINNACLE_TRACKING_ADC_CONFIG_1X;
-    }
+static int pinnacle_sample_fetch(const struct device *dev, union pinnacle_sample *sample)
+{
+	const struct pinnacle_config *config = dev->config;
+
+	uint8_t rx[4];
+	int rc;
+
+	if (config->relative_mode) {
+		rc = pinnacle_seq_read(dev, PINNACLE_REG_PACKET_BYTE0, rx, 3);
+	} else {
+		rc = pinnacle_seq_read(dev, PINNACLE_REG_PACKET_BYTE2, rx, 4);
+	}
+
+	if (rc) {
+		LOG_ERR("Failed to read data from SPI device");
+		return rc;
+	}
+
+	pinnacle_decode_sample(dev, rx, sample);
+
+	rc = pinnacle_write(dev, PINNACLE_REG_STATUS1, 0x00);
+	if (rc) {
+		LOG_ERR("Failed to clear SW_CC and SW_DR");
+		return rc;
+	}
+
+	return 0;
 }
 
-static int pinnacle_tune_edge_sensitivity(const struct device *dev) {
-    const struct pinnacle_config *config = dev->config;
-    int ret;
+static int pinnacle_handle_interrupt(const struct device *dev)
+{
+	const struct pinnacle_config *config = dev->config;
+	struct pinnacle_data *drv_data = dev->data;
+	union pinnacle_sample *sample = &drv_data->sample;
 
-    uint8_t x_val;
-    ret = pinnacle_era_read(dev, PINNACLE_ERA_REG_X_AXIS_WIDE_Z_MIN, &x_val);
-    if (ret < 0) {
-        LOG_WRN("Failed to read X val");
-        return ret;
-    }
+	int rc;
 
-    LOG_WRN("X val: %d", x_val);
+	rc = pinnacle_sample_fetch(dev, sample);
+	if (rc) {
+		LOG_ERR("Failed to read data packets");
+		return rc;
+	}
 
-    uint8_t y_val;
-    ret = pinnacle_era_read(dev, PINNACLE_ERA_REG_Y_AXIS_WIDE_Z_MIN, &y_val);
-    if (ret < 0) {
-        LOG_WRN("Failed to read Y val");
-        return ret;
-    }
+	if (config->relative_mode) {
+		input_report_rel(dev, INPUT_REL_X, sample->rel_x, false, K_FOREVER);
+		input_report_rel(dev, INPUT_REL_Y, sample->rel_y, !config->primary_tap_enabled,
+				 K_FOREVER);
+		if (config->primary_tap_enabled) {
+			input_report_key(dev, INPUT_BTN_TOUCH, sample->btn_primary, true,
+					 K_FOREVER);
+		}
+	} else {
+		if (config->clipping_enabled && !pinnacle_is_idle_sample(sample)) {
+			pinnacle_clip_sample(dev, sample);
+			if (config->scaling_enabled) {
+				pinnacle_scale_sample(dev, sample);
+			}
+		}
 
-    LOG_WRN("Y val: %d", y_val);
+		input_report_abs(dev, INPUT_ABS_X, sample->abs_x, false, K_FOREVER);
+		input_report_abs(dev, INPUT_ABS_Y, sample->abs_y, false, K_FOREVER);
+		input_report_abs(dev, INPUT_ABS_Z, sample->abs_z, true, K_FOREVER);
+	}
 
-    ret = pinnacle_era_write(dev, PINNACLE_ERA_REG_X_AXIS_WIDE_Z_MIN, config->x_axis_z_min);
-    if (ret < 0) {
-        LOG_ERR("Failed to set X-Axis Min-Z %d", ret);
-        return ret;
-    }
-    ret = pinnacle_era_write(dev, PINNACLE_ERA_REG_Y_AXIS_WIDE_Z_MIN, config->y_axis_z_min);
-    if (ret < 0) {
-        LOG_ERR("Failed to set Y-Axis Min-Z %d", ret);
-        return ret;
-    }
-    return 0;
+	return 0;
 }
 
-static int pinnacle_set_adc_tracking_sensitivity(const struct device *dev) {
-    const struct pinnacle_config *config = dev->config;
+static void pinnacle_data_ready_gpio_callback(const struct device *dev, struct gpio_callback *cb,
+					      uint32_t pins)
+{
+	struct pinnacle_data *drv_data = CONTAINER_OF(cb, struct pinnacle_data, dr_cb_data);
 
-    uint8_t val;
-    int ret = pinnacle_era_read(dev, PINNACLE_ERA_REG_TRACKING_ADC_CONFIG, &val);
-    if (ret < 0) {
-        LOG_ERR("Failed to get ADC sensitivity %d", ret);
-    }
-
-    val &= 0x3F;
-    val |= pinnacle_adc_sensitivity_reg_value(config->sensitivity);
-
-    ret = pinnacle_era_write(dev, PINNACLE_ERA_REG_TRACKING_ADC_CONFIG, val);
-    if (ret < 0) {
-        LOG_ERR("Failed to set ADC sensitivity %d", ret);
-    }
-    ret = pinnacle_era_read(dev, PINNACLE_ERA_REG_TRACKING_ADC_CONFIG, &val);
-    if (ret < 0) {
-        LOG_ERR("Failed to get ADC sensitivity %d", ret);
-    }
-
-    return ret;
+	k_work_submit(&drv_data->work);
 }
 
-static int pinnacle_force_recalibrate(const struct device *dev) {
-    uint8_t val;
-    int ret = pinnacle_seq_read(dev, PINNACLE_CAL_CFG, &val, 1);
-    if (ret < 0) {
-        LOG_ERR("Failed to get cal config %d", ret);
-    }
+static void pinnacle_work_cb(struct k_work *work)
+{
+	struct pinnacle_data *drv_data = CONTAINER_OF(work, struct pinnacle_data, work);
 
-    val |= 0x01;
-    ret = pinnacle_write(dev, PINNACLE_CAL_CFG, val);
-    if (ret < 0) {
-        LOG_ERR("Failed to force calibration %d", ret);
-    }
-
-    do {
-        pinnacle_seq_read(dev, PINNACLE_CAL_CFG, &val, 1);
-    } while (val & 0x01);
-
-    return ret;
+	pinnacle_handle_interrupt(drv_data->dev);
 }
 
-int pinnacle_set_sleep(const struct device *dev, bool enabled) {
-    uint8_t sys_cfg;
-    int ret = pinnacle_seq_read(dev, PINNACLE_SYS_CFG, &sys_cfg, 1);
-    if (ret < 0) {
-        LOG_ERR("can't read sys config %d", ret);
-        return ret;
-    }
+int pinnacle_init_interrupt(const struct device *dev)
+{
+	struct pinnacle_data *drv_data = dev->data;
+	const struct pinnacle_config *config = dev->config;
+	const struct gpio_dt_spec *gpio = &config->dr_gpio;
 
-    if (((sys_cfg & PINNACLE_SYS_CFG_EN_SLEEP) != 0) == enabled) {
-        return 0;
-    }
+	int rc;
 
-    LOG_DBG("Setting sleep: %s", (enabled ? "on" : "off"));
-    WRITE_BIT(sys_cfg, PINNACLE_SYS_CFG_EN_SLEEP_BIT, enabled ? 1 : 0);
+	drv_data->dev = dev;
+	drv_data->work.handler = pinnacle_work_cb;
 
-    ret = pinnacle_write(dev, PINNACLE_SYS_CFG, sys_cfg);
-    if (ret < 0) {
-        LOG_ERR("can't write sleep config %d", ret);
-        return ret;
-    }
+	/* Configure GPIO pin for HW_DR signal */
+	rc = gpio_is_ready_dt(gpio);
+	if (!rc) {
+		LOG_ERR("GPIO device %s/%d is not ready", gpio->port->name, gpio->pin);
+		return -ENODEV;
+	}
 
-    return ret;
+	rc = gpio_pin_configure_dt(gpio, GPIO_INPUT);
+	if (rc) {
+		LOG_ERR("Failed to configure %s/%d as input", gpio->port->name, gpio->pin);
+		return rc;
+	}
+
+	rc = gpio_pin_interrupt_configure_dt(gpio, GPIO_INT_EDGE_TO_ACTIVE);
+	if (rc) {
+		LOG_ERR("Failed to configured interrupt for %s/%d", gpio->port->name, gpio->pin);
+		return rc;
+	}
+
+	gpio_init_callback(&drv_data->dr_cb_data, pinnacle_data_ready_gpio_callback,
+			   BIT(gpio->pin));
+
+	rc = gpio_add_callback(gpio->port, &drv_data->dr_cb_data);
+	if (rc) {
+		LOG_ERR("Failed to configured interrupt for %s/%d", gpio->port->name, gpio->pin);
+		return rc;
+	}
+
+	return 0;
 }
 
-static int pinnacle_init(const struct device *dev) {
-    struct pinnacle_data *data = dev->data;
-    const struct pinnacle_config *config = dev->config;
-    int ret;
+static int pinnacle_init(const struct device *dev)
+{
+	const struct pinnacle_config *config = dev->config;
 
-    uint8_t fw_id[2];
-    ret = pinnacle_seq_read(dev, PINNACLE_FW_ID, fw_id, 2);
-    if (ret < 0) {
-        LOG_ERR("Failed to get the FW ID %d", ret);
-    }
+	int rc;
+	bool ret;
+	uint8_t value;
 
-    LOG_DBG("Found device with FW ID: 0x%02x, Version: 0x%02x", fw_id[0], fw_id[1]);
+	if (!pinnacle_bus_is_ready(dev)) {
+		return -ENODEV;
+	}
 
-    data->in_int = false;
-    k_msleep(10);
-    ret = pinnacle_write(dev, PINNACLE_STATUS1, 0); // Clear CC
-    if (ret < 0) {
-        LOG_ERR("can't write %d", ret);
-        return ret;
-    }
-    k_usleep(50);
-    ret = pinnacle_write(dev, PINNACLE_SYS_CFG, PINNACLE_SYS_CFG_RESET);
-    if (ret < 0) {
-        LOG_ERR("can't reset %d", ret);
-        return ret;
-    }
-    k_msleep(20);
-    // In absolute mode a burst of Z-idle (all-zero) packets marks lift-off.
-    // Use 3 packets for redundancy: packets are occasionally dropped (e.g.
-    // the STATUS1 == 0xFF glitch guard in pinnacle_report_data), and losing
-    // the only lift-off packet would leave consumers stuck in a touching
-    // state. Consumers dedup repeated Z-idle frames, so the extras are
-    // free. In relative mode keep the original value.
-    ret = pinnacle_write(dev, PINNACLE_Z_IDLE, config->abs_mode ? 0x03 : 0x05);
-    if (ret < 0) {
-        LOG_ERR("can't write %d", ret);
-        return ret;
-    }
+	rc = pinnacle_read(dev, PINNACLE_REG_FIRMWARE_ID, &value);
+	if (rc) {
+		LOG_ERR("Failed to read FirmwareId");
+		return rc;
+	}
 
-    ret = pinnacle_set_adc_tracking_sensitivity(dev);
-    if (ret < 0) {
-        LOG_ERR("Failed to set ADC sensitivity %d", ret);
-        return ret;
-    }
+	if (value != PINNACLE_FIRMWARE_ID) {
+		LOG_ERR("Incorrect Firmware ASIC ID %x", value);
+		return -ENODEV;
+	}
 
-    ret = pinnacle_tune_edge_sensitivity(dev);
-    if (ret < 0) {
-        LOG_ERR("Failed to tune edge sensitivity %d", ret);
-        return ret;
-    }
-    ret = pinnacle_force_recalibrate(dev);
-    if (ret < 0) {
-        LOG_ERR("Failed to force recalibration %d", ret);
-        return ret;
-    }
+	/* Wait until the calibration is completed (SW_CC is asserted) */
+	ret = WAIT_FOR(pinnacle_read(dev, PINNACLE_REG_STATUS1, &value) == 0 &&
+		       (value & PINNACLE_STATUS1_SW_CC) == PINNACLE_STATUS1_SW_CC,
+		       PINNACLE_CALIBRATION_AWAIT_RETRY_COUNT *
+		       PINNACLE_CALIBRATION_AWAIT_DELAY_POLL_US,
+		       k_sleep(K_USEC(PINNACLE_CALIBRATION_AWAIT_DELAY_POLL_US)));
+	if (!ret) {
+		LOG_ERR("Failed to wait for calibration complition");
+		return -EIO;
+	}
 
-    if (config->sleep_en) {
-        ret = pinnacle_set_sleep(dev, true);
-        if (ret < 0) {
-            return ret;
-        }
-    }
+	/* Clear SW_CC after Power on Reset */
+	rc = pinnacle_clear_cmd_complete(dev);
+	if (rc) {
+		LOG_ERR("Failed to clear SW_CC in Status1");
+		return -EIO;
+	}
 
-    uint8_t packet[1];
-    ret = pinnacle_seq_read(dev, PINNACLE_SLEEP_INTERVAL, packet, 1);
+	/* Set trackpad sensitivity */
+	rc = pinnacle_set_sensitivity(dev);
+	if (rc) {
+		LOG_ERR("Failed to set sensitivity");
+		return -EIO;
+	}
 
-    if (ret >= 0) {
-        LOG_DBG("Default sleep interval %d", packet[0]);
-    }
+	rc = pinnacle_write(dev, PINNACLE_REG_SYS_CONFIG1, 0x00);
+	if (rc) {
+		LOG_ERR("Failed to write SysConfig1");
+		return rc;
+	}
 
-    ret = pinnacle_write(dev, PINNACLE_SLEEP_INTERVAL, 255);
-    if (ret <= 0) {
-        LOG_DBG("Failed to update sleep interaval %d", ret);
-    }
+	/* Relative mode features */
+	if (config->relative_mode) {
+		value = (PINNACLE_FEED_CONFIG2_GLIDE_EXTEND_DISABLE |
+			 PINNACLE_FEED_CONFIG2_SCROLL_DISABLE |
+			 PINNACLE_FEED_CONFIG2_SECONDARY_TAP_DISABLE);
+		if (config->swap_xy) {
+			value |= PINNACLE_FEED_CONFIG2_SWAP_X_AND_Y;
+		}
+		if (!config->primary_tap_enabled) {
+			value |= PINNACLE_FEED_CONFIG2_ALL_TAPS_DISABLE;
+		}
+	} else {
+		value = (PINNACLE_FEED_CONFIG2_GLIDE_EXTEND_DISABLE |
+			 PINNACLE_FEED_CONFIG2_SCROLL_DISABLE |
+			 PINNACLE_FEED_CONFIG2_SECONDARY_TAP_DISABLE |
+			 PINNACLE_FEED_CONFIG2_ALL_TAPS_DISABLE);
+	}
+	rc = pinnacle_write(dev, PINNACLE_REG_FEED_CONFIG2, value);
+	if (rc) {
+		LOG_ERR("Failed to write FeedConfig2");
+		return rc;
+	}
 
-    uint8_t feed_cfg2 = PINNACLE_FEED_CFG2_EN_IM | PINNACLE_FEED_CFG2_EN_BTN_SCRL;
-    if (config->no_taps) {
-        feed_cfg2 |= PINNACLE_FEED_CFG2_DIS_TAP;
-    }
+	/* Data output flags */
+	value = PINNACLE_FEED_CONFIG1_FEED_ENABLE;
+	if (!config->relative_mode) {
+		value |= PINNACLE_FEED_CONFIG1_DATA_MODE_ABSOLUTE;
+		if (config->invert_x) {
+			value |= PINNACLE_FEED_CONFIG1_X_INVERT;
+		}
+		if (config->invert_y) {
+			value |= PINNACLE_FEED_CONFIG1_Y_INVERT;
+		}
+	}
+	rc = pinnacle_write(dev, PINNACLE_REG_FEED_CONFIG1, value);
+	if (rc) {
+		LOG_ERR("Failed to enable Feed in FeedConfig1");
+		return rc;
+	}
 
-    if (config->no_secondary_tap) {
-        feed_cfg2 |= PINNACLE_FEED_CFG2_DIS_SEC;
-    }
+	/* Configure count of Z-Idle packets */
+	rc = pinnacle_write(dev, PINNACLE_REG_Z_IDLE, config->idle_packets_count);
+	if (rc) {
+		LOG_ERR("Failed to set count of Z-idle packets");
+		return rc;
+	}
 
-    if (config->rotate_90) {
-        feed_cfg2 |= PINNACLE_FEED_CFG2_ROTATE_90;
-    }
-    ret = pinnacle_write(dev, PINNACLE_FEED_CFG2, feed_cfg2);
-    if (ret < 0) {
-        LOG_ERR("can't write %d", ret);
-        return ret;
-    }
-    uint8_t feed_cfg1 = PINNACLE_FEED_CFG1_EN_FEED;
-    if (config->abs_mode) {
-        // Absolute mode: report raw pad coordinates; the invert/rotate feed
-        // transforms only apply to relative data, so don't request them.
-        feed_cfg1 |= PINNACLE_FEED_CFG1_ABS_MODE;
-    } else {
-        if (config->x_invert) {
-            feed_cfg1 |= PINNACLE_FEED_CFG1_INV_X;
-        }
+	rc = pinnacle_init_interrupt(dev);
+	if (rc) {
+		LOG_ERR("Failed to initialize interrupts");
+		return rc;
+	}
 
-        if (config->y_invert) {
-            feed_cfg1 |= PINNACLE_FEED_CFG1_INV_Y;
-        }
-    }
-    if (feed_cfg1) {
-        ret = pinnacle_write(dev, PINNACLE_FEED_CFG1, feed_cfg1);
-    }
-    if (ret < 0) {
-        LOG_ERR("can't write %d", ret);
-        return ret;
-    }
-
-    data->dev = dev;
-
-    pinnacle_clear_status(dev);
-
-    gpio_pin_configure_dt(&config->dr, GPIO_INPUT);
-    gpio_init_callback(&data->gpio_cb, pinnacle_gpio_cb, BIT(config->dr.pin));
-    ret = gpio_add_callback(config->dr.port, &data->gpio_cb);
-    if (ret < 0) {
-        LOG_ERR("Failed to set DR callback: %d", ret);
-        return -EIO;
-    }
-
-    k_work_init(&data->work, pinnacle_work_cb);
-
-    pinnacle_write(dev, PINNACLE_FEED_CFG1, feed_cfg1);
-
-    set_int(dev, true);
-
-    return 0;
+	return 0;
 }
 
-#if IS_ENABLED(CONFIG_PM_DEVICE)
+#define PINNACLE_CONFIG_BUS_I2C(inst)                                                              \
+	.bus = {                                                                                   \
+		.i2c = I2C_DT_SPEC_INST_GET(inst),                                                 \
+		.is_ready = pinnacle_is_ready_i2c,                                                 \
+		.write = pinnacle_write_i2c,                                                       \
+		.seq_write = pinnacle_seq_write_i2c,                                               \
+		.read = pinnacle_read_i2c,                                                         \
+		.seq_read = pinnacle_seq_read_i2c,                                                 \
+	}
 
-static int pinnacle_pm_action(const struct device *dev, enum pm_device_action action) {
-    switch (action) {
-    case PM_DEVICE_ACTION_SUSPEND:
-        return set_int(dev, false);
-    case PM_DEVICE_ACTION_RESUME:
-        return set_int(dev, true);
-    default:
-        return -ENOTSUP;
-    }
-}
+#define PINNACLE_SPI_OP (SPI_OP_MODE_MASTER | SPI_TRANSFER_MSB | SPI_MODE_CPHA | SPI_WORD_SET(8))
+#define PINNACLE_CONFIG_BUS_SPI(inst)                                                              \
+	.bus = {                                                                                   \
+		.spi = SPI_DT_SPEC_INST_GET(inst, PINNACLE_SPI_OP, 0U),                            \
+		.is_ready = pinnacle_is_ready_spi,                                                 \
+		.write = pinnacle_write_spi,                                                       \
+		.seq_write = pinnacle_seq_write_spi,                                               \
+		.read = pinnacle_read_spi,                                                         \
+		.seq_read = pinnacle_seq_read_spi,                                                 \
+	}
 
-#endif // IS_ENABLED(CONFIG_PM_DEVICE)
+#define PINNACLE_DEFINE(inst)                                                                      \
+	static const struct pinnacle_config pinnacle_config_##inst = {                             \
+		COND_CODE_1(DT_INST_ON_BUS(inst, i2c), (PINNACLE_CONFIG_BUS_I2C(inst),), ())       \
+		COND_CODE_1(DT_INST_ON_BUS(inst, spi), (PINNACLE_CONFIG_BUS_SPI(inst),), ())       \
+		.dr_gpio = GPIO_DT_SPEC_INST_GET_OR(inst, data_ready_gpios, {}),                   \
+		.relative_mode = DT_INST_ENUM_IDX(inst, data_mode),                                \
+		.sensitivity = DT_INST_ENUM_IDX(inst, sensitivity),                                \
+		.idle_packets_count = DT_INST_PROP(inst, idle_packets_count),                      \
+		.clipping_enabled = DT_INST_PROP(inst, clipping_enable),                           \
+		.active_range_x_min = DT_INST_PROP(inst, active_range_x_min),                      \
+		.active_range_x_max = DT_INST_PROP(inst, active_range_x_max),                      \
+		.active_range_y_min = DT_INST_PROP(inst, active_range_y_min),                      \
+		.active_range_y_max = DT_INST_PROP(inst, active_range_y_max),                      \
+		.scaling_enabled = DT_INST_PROP(inst, scaling_enable),                             \
+		.resolution_x = DT_INST_PROP(inst, scaling_x_resolution),                          \
+		.resolution_y = DT_INST_PROP(inst, scaling_y_resolution),                          \
+		.invert_x = DT_INST_PROP(inst, invert_x),                                          \
+		.invert_y = DT_INST_PROP(inst, invert_y),                                          \
+		.primary_tap_enabled = DT_INST_PROP(inst, primary_tap_enable),                     \
+		.swap_xy = DT_INST_PROP(inst, swap_xy),                                            \
+	};                                                                                         \
+	static struct pinnacle_data pinnacle_data_##inst;                                          \
+	DEVICE_DT_INST_DEFINE(inst, pinnacle_init, NULL, &pinnacle_data_##inst,                    \
+			      &pinnacle_config_##inst, POST_KERNEL, CONFIG_INPUT_INIT_PRIORITY,    \
+			      NULL);                                                               \
+	BUILD_ASSERT(DT_INST_PROP(inst, active_range_x_min) <                                      \
+			     DT_INST_PROP(inst, active_range_x_max),                               \
+		     "active-range-x-min must be less than active-range-x-max");                   \
+	BUILD_ASSERT(DT_INST_PROP(inst, active_range_y_min) <                                      \
+			     DT_INST_PROP(inst, active_range_y_max),                               \
+		     "active_range-y-min must be less than active_range-y-max");                   \
+	BUILD_ASSERT(DT_INST_PROP(inst, scaling_x_resolution) > 0,                                 \
+		     "scaling-x-resolution must be positive");                                     \
+	BUILD_ASSERT(DT_INST_PROP(inst, scaling_y_resolution) > 0,                                 \
+		     "scaling-y-resolution must be positive");                                     \
+	BUILD_ASSERT(IN_RANGE(DT_INST_PROP(inst, idle_packets_count), 0, UINT8_MAX),               \
+		     "idle-packets-count must be in range [0:255]");
 
-#define PINNACLE_INST(n)                                                                           \
-    static struct pinnacle_data pinnacle_data_##n;                                                 \
-    static const struct pinnacle_config pinnacle_config_##n = {                                    \
-        COND_CODE_1(DT_INST_ON_BUS(n, i2c),                                                        \
-                    (.bus = {.i2c = I2C_DT_SPEC_INST_GET(n)}, .seq_read = pinnacle_i2c_seq_read,   \
-                     .write = pinnacle_i2c_write),                                                 \
-                    (.bus = {.spi = SPI_DT_SPEC_INST_GET(n,                                        \
-                                                         SPI_OP_MODE_MASTER | SPI_WORD_SET(8) |    \
-                                                             SPI_TRANSFER_MSB | SPI_MODE_CPHA,     \
-                                                         0)},                                      \
-                     .seq_read = pinnacle_spi_seq_read, .write = pinnacle_spi_write)),             \
-        .rotate_90 = DT_INST_PROP(n, rotate_90),                                                   \
-        .x_invert = DT_INST_PROP(n, x_invert),                                                     \
-        .y_invert = DT_INST_PROP(n, y_invert),                                                     \
-        .sleep_en = DT_INST_PROP(n, sleep),                                                        \
-        .no_taps = DT_INST_PROP(n, no_taps),                                                       \
-        .no_secondary_tap = DT_INST_PROP(n, no_secondary_tap),                                     \
-        .abs_mode = DT_INST_PROP(n, abs_mode),                                                     \
-        .x_axis_z_min = DT_INST_PROP_OR(n, x_axis_z_min, 5),                                       \
-        .y_axis_z_min = DT_INST_PROP_OR(n, y_axis_z_min, 4),                                       \
-        .sensitivity = DT_INST_ENUM_IDX_OR(n, sensitivity, PINNACLE_SENSITIVITY_1X),               \
-        .dr = GPIO_DT_SPEC_GET_OR(DT_DRV_INST(n), dr_gpios, {}),                                   \
-    };                                                                                             \
-    PM_DEVICE_DT_INST_DEFINE(n, pinnacle_pm_action);                                               \
-    DEVICE_DT_INST_DEFINE(n, pinnacle_init, PM_DEVICE_DT_INST_GET(n), &pinnacle_data_##n,          \
-                          &pinnacle_config_##n, POST_KERNEL, CONFIG_INPUT_PINNACLE_INIT_PRIORITY,  \
-                          NULL);
-
-DT_INST_FOREACH_STATUS_OKAY(PINNACLE_INST)
+DT_INST_FOREACH_STATUS_OKAY(PINNACLE_DEFINE)

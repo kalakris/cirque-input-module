@@ -1,28 +1,17 @@
-# Copyright (c) 2022 The ZMK Contributors
-# SPDX-License-Identifier: MIT
+# Cirque Pinnacle 1CA027 touch controller based device configuration options
+#
+# Vendored copy of upstream Zephyr's drivers/input/Kconfig.pinnacle, adapted
+# to be usable as an out-of-tree module on Zephyr 3.5 (ZMK).
+#
+# Copyright (c) 2024 Ilia Kharin
+# SPDX-License-Identifier: Apache-2.0
 
-menuconfig INPUT_PINNACLE
-    bool "Cirque Pinnacle trackpads"
+config INPUT_PINNACLE
+    bool "Cirque Pinnacle 1CA027 Touch Controller Based Device"
     default y
+    depends on INPUT
     depends on GPIO
     depends on SPI || I2C
-    depends on INPUT
     depends on DT_HAS_CIRQUE_PINNACLE_ENABLED
     help
-      Enable driver for Cirque Pinnacle trackpads
-
-if INPUT_PINNACLE
-
-config INPUT_PINNACLE_INIT_PRIORITY
-    int "Cirque Pinnacle initialization priority"
-    default INPUT_INIT_PRIORITY
-
-if ZMK_MOUSE
-
-config ZMK_INPUT_PINNACLE_IDLE_SLEEPER
-    bool "Pinnacle Sleep linked to ZMK idle state"
-    default n
-
-endif
-
-endif
+      Enable driver for Cirque Pinnacle 1CA027 tracked input device.
