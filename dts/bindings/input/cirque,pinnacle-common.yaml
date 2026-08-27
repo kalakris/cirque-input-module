@@ -1,59 +1,125 @@
+# Vendored verbatim from zephyrproject-rtos/zephyr, branch main
+# (27150c9dd348690a6b41d3992dd5d3d1458fdc66), dts/bindings/input/cirque,pinnacle-common.yaml.
+#
+# Local change: the `min:`/`max:` property keys were stripped, because
+# Zephyr 3.5's edtlib rejects them as unknown binding keys. They are
+# validation-only and carry no runtime meaning.
+# Copyright (c) 2024 Ilia Kharin
+# SPDX-License-Identifier: Apache-2.0
+
+description: Cirque Pinnacle 1CA027 ASIC trackpad
+
 properties:
-  dr-gpios:
+  data-ready-gpios:
     type: phandle-array
-    description: Data ready pin for the trackpad
-  rotate-90:
-    type: boolean
-  x-invert:
-    type: boolean
-  y-invert:
-    type: boolean
-  sleep:
-    type: boolean
-  no-secondary-tap:
-    type: boolean
-  no-taps:
-    type: boolean
-  abs-mode:
-    type: boolean
     description: |
-      Run the Pinnacle in absolute mode. Instead of relative REL_X/REL_Y
-      deltas, the driver reports INPUT_ABS_X (0-2047), INPUT_ABS_Y (0-1535)
-      and INPUT_ABS_Z (touch strength, 0 on lift-off) per sample. Hardware
-      tap gestures and the X/Y inversion / rotation feed transforms are not
-      applied in this mode; consumers get raw pad coordinates.
-  stream-tap-click:
-    type: boolean
-    description: |
-      Enable firmware tap-to-click for consumers of the absolute stream
-      (ZMK's CONFIG_ZMK_TOUCH_STREAM module). Only meaningful together
-      with abs-mode, which disables the ASIC's own hardware tap
-      gestures. A touch that lifts off within stream-tap-max-ms and
-      moves at most stream-tap-max-movement raw counts is injected as a
-      button-0 click into the normal input pipeline. The driver itself
-      ignores this property.
-  stream-tap-max-ms:
-    type: int
-    default: 180
-    description: Maximum touch duration (ms) for a stream tap-to-click.
-  stream-tap-max-movement:
-    type: int
-    default: 30
-    description: |
-      Maximum movement (raw counts, per-axis Chebyshev distance from the
-      touch-down point) for a stream tap-to-click.
+      Data Ready (DR) GPIO pin. The DR pin is connected to Pinnacle HW_DR
+      which is active high when SW_DR or SW_CC are asserted. If connected
+      directly, the MCU pin should be configured as active low.
+
   sensitivity:
     type: string
+    default: "4x"
+    description: |
+      ADC attenuation, 1x is the most sensitive and 4x is the least sensitive.
     enum:
-      - 1x
-      - 2x
-      - 3x
-      - 4x
-    description: ADC attenuation (sensitivity) setting.
-  x-axis-z-min:
-    type: int
-    default: 5
-  y-axis-z-min:
-    type: int
-    default: 4
+      - "1x"
+      - "2x"
+      - "3x"
+      - "4x"
 
+  data-mode:
+    type: string
+    default: "relative"
+    description: |
+      Data output mode in which position is reported. In the relative mode
+      each position is reported as relative to the last position. In the
+      absolute mode absolute coordinates are reported.
+    enum:
+      - "absolute"
+      - "relative"
+
+  idle-packets-count:
+    type: int
+    default: 0
+    description: |
+      The number of empty packets where both X and Y are set to 0. They are
+      started to be sent when a finger presence is detected missing (no touch
+      detected) every 10 ms. They are stopped to be sent when a finger presence
+      it detected. An application can count these packets in order to detect
+      taps. When set to 0, no empty packets are sent. Supported values from 0
+      to 255.
+
+  sleep-mode-enable:
+    type: boolean
+    description: |
+      Enable sleep mode, allowing the hardware to enter a lower power mode
+      after 5 seconds with no finger detected.
+
+  clipping-enable:
+    type: boolean
+    description: |
+      In the absolute mode enable clipping of reported coordinates which are
+      outside of the active range.
+
+  active-range-x-min:
+    type: int
+    default: 128
+    description: |
+      The minimum X value which can be reported.
+
+  active-range-x-max:
+    type: int
+    default: 1920
+    description: |
+      The maximum X value which can be reported.
+
+  active-range-y-min:
+    type: int
+    default: 64
+    description: |
+      The minimum Y value which can be reported.
+
+  active-range-y-max:
+    type: int
+    default: 1472
+    description: |
+      The maximum Y value which can be reported.
+
+  scaling-enable:
+    type: boolean
+    description: |
+      In the absolute mode enable scaling of coordinates according to
+      the specified resolution for X and Y axises. The scaling is applied only
+      when the clipping is enabled.
+
+  scaling-x-resolution:
+    type: int
+    default: 1024
+    description: Resolution for the X axis.
+
+  scaling-y-resolution:
+    type: int
+    default: 1024
+    description: Resolution for the Y axis.
+
+  invert-x:
+    type: boolean
+    description: |
+      Invert X coordinate values, in both relative and absolute modes.
+
+  invert-y:
+    type: boolean
+    description: |
+      Invert Y coordinate values, in both relative and absolute modes.
+
+  primary-tap-enable:
+    type: boolean
+    description: |
+      In the relative mode enable the primary tap.
+
+  swap-xy:
+    type: boolean
+    description: |
+      In the relative mode swap X and Y coordinates. This is equivalent for
+      rotating coordinates by 90 degrees.
