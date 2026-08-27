@@ -81,6 +81,9 @@ LOG_MODULE_REGISTER(pinnacle, CONFIG_INPUT_LOG_LEVEL);
 
 /* Extended Register Access */
 #define PINNACLE_ERA_REG_CONFIG 0x0187 /* R/W */
+/* Per-axis minimum Z ("wide Z min") used for edge sensitivity tuning */
+#define PINNACLE_ERA_REG_X_AXIS_WIDE_Z_MIN 0x0149 /* R/W */
+#define PINNACLE_ERA_REG_Y_AXIS_WIDE_Z_MIN 0x0168 /* R/W */
 
 /* Firmware ASIC ID value */
 #define PINNACLE_FIRMWARE_ID 0x07
@@ -209,6 +212,9 @@ struct pinnacle_config {
 
 	uint16_t resolution_x;
 	uint16_t resolution_y;
+
+	uint8_t x_axis_z_min;
+	uint8_t y_axis_z_min;
 };
 
 union pinnacle_sample {
@@ -382,6 +388,32 @@ static int pinnacle_set_sensitivity(const struct device *dev)
 	}
 
 	return 0;
+}
+
+/*
+ * Tune the per-axis minimum Z threshold. Lowering it makes the pad pick up
+ * light touches near its edges, where the sensed capacitance is smaller;
+ * raising it rejects noise. The defaults match the ASIC's power-on values,
+ * so leaving the properties unset is a no-op.
+ */
+static int pinnacle_set_edge_sensitivity(const struct device *dev)
+{
+	const struct pinnacle_config *config = dev->config;
+
+	int rc;
+
+	rc = pinnacle_era_write(dev, PINNACLE_ERA_REG_X_AXIS_WIDE_Z_MIN, config->x_axis_z_min);
+	if (rc) {
+		return rc;
+	}
+
+	rc = pinnacle_era_write(dev, PINNACLE_ERA_REG_Y_AXIS_WIDE_Z_MIN, config->y_axis_z_min);
+	if (rc) {
+		return rc;
+	}
+
+	/* Clear SW_CC after the ERA writes */
+	return pinnacle_clear_cmd_complete(dev);
 }
 
 #if DT_ANY_INST_ON_BUS_STATUS_OKAY(i2c)
@@ -843,6 +875,13 @@ static int pinnacle_init(const struct device *dev)
 		return -EIO;
 	}
 
+	/* Set per-axis edge sensitivity */
+	rc = pinnacle_set_edge_sensitivity(dev);
+	if (rc) {
+		LOG_ERR("Failed to set edge sensitivity");
+		return -EIO;
+	}
+
 	value = 0x00;
 	if (config->sleep_mode_enable) {
 		value |= PINNACLE_SYS_CONFIG1_LOW_POWER_MODE;
@@ -960,6 +999,8 @@ static int pinnacle_init(const struct device *dev)
 		.invert_y = DT_INST_PROP(inst, invert_y),                                          \
 		.primary_tap_enabled = DT_INST_PROP(inst, primary_tap_enable),                     \
 		.swap_xy = DT_INST_PROP(inst, swap_xy),                                            \
+		.x_axis_z_min = DT_INST_PROP(inst, x_axis_z_min),                                  \
+		.y_axis_z_min = DT_INST_PROP(inst, y_axis_z_min),                                  \
 	};                                                                                         \
 	static struct pinnacle_data pinnacle_data_##inst;                                          \
 	DEVICE_DT_INST_DEFINE(inst, pinnacle_init, NULL, &pinnacle_data_##inst,                    \

@@ -123,3 +123,20 @@ properties:
     description: |
       In the relative mode swap X and Y coordinates. This is equivalent for
       rotating coordinates by 90 degrees.
+
+  # ---- Out-of-tree addition: per-axis edge sensitivity (ERA registers) ----
+  x-axis-z-min:
+    type: int
+    default: 5
+    description: |
+      Minimum Z ("wide Z min") for the X axis, written to extended register
+      0x0149. Lower values make the pad more sensitive to light touches near
+      its edges. The default is the ASIC's power-on value. Range 0 to 255.
+
+  y-axis-z-min:
+    type: int
+    default: 4
+    description: |
+      Minimum Z ("wide Z min") for the Y axis, written to extended register
+      0x0168. Lower values make the pad more sensitive to light touches near
+      its edges. The default is the ASIC's power-on value. Range 0 to 255.
