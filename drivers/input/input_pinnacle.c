@@ -637,8 +637,26 @@ static int pinnacle_sample_fetch(const struct device *dev, union pinnacle_sample
 {
 	const struct pinnacle_config *config = dev->config;
 
+	uint8_t status;
 	uint8_t rx[4];
 	int rc;
+
+	rc = pinnacle_read(dev, PINNACLE_REG_STATUS1, &status);
+	if (rc) {
+		LOG_ERR("Failed to read Status1");
+		return rc;
+	}
+
+	/*
+	 * 0xFF is not a valid Status1 value, it is what a failed bus read
+	 * returns; and with SW_DR de-asserted there is no new sample to read.
+	 * In either case the packet registers hold garbage, so drop the frame
+	 * instead of reporting it.
+	 */
+	if (status == 0xFF || (status & PINNACLE_STATUS1_SW_DR) == 0) {
+		LOG_DBG("Ignoring suspicious Status1 value 0x%02x", status);
+		return -EAGAIN;
+	}
 
 	if (config->relative_mode) {
 		rc = pinnacle_seq_read(dev, PINNACLE_REG_PACKET_BYTE0, rx, 3);
@@ -671,6 +689,10 @@ static int pinnacle_handle_interrupt(const struct device *dev)
 	int rc;
 
 	rc = pinnacle_sample_fetch(dev, sample);
+	if (rc == -EAGAIN) {
+		/* No valid sample available; not an error. */
+		return 0;
+	}
 	if (rc) {
 		LOG_ERR("Failed to read data packets");
 		return rc;
