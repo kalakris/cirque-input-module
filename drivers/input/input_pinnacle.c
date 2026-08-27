@@ -92,6 +92,9 @@ LOG_MODULE_REGISTER(pinnacle, CONFIG_INPUT_LOG_LEVEL);
 #define PINNACLE_STATUS1_SW_DR BIT(2)
 #define PINNACLE_STATUS1_SW_CC BIT(3)
 
+/* CalConfig1 definition */
+#define PINNACLE_CAL_CONFIG1_CALIBRATE BIT(0)
+
 /* SysConfig1 definition */
 #define PINNACLE_SYS_CONFIG1_RESET          BIT(0)
 #define PINNACLE_SYS_CONFIG1_SHUTDOWN       BIT(1)
@@ -144,6 +147,13 @@ LOG_MODULE_REGISTER(pinnacle, CONFIG_INPUT_LOG_LEVEL);
  */
 #define PINNACLE_CALIBRATION_AWAIT_DELAY_POLL_US 50000
 #define PINNACLE_CALIBRATION_AWAIT_RETRY_COUNT   4
+
+/*
+ * Delay and retry count for waiting completion of a forced recalibration with
+ * 200 ms of timeout.
+ */
+#define PINNACLE_RECALIBRATION_AWAIT_DELAY_POLL_US 10000
+#define PINNACLE_RECALIBRATION_AWAIT_RETRY_COUNT   20
 
 /*
  * Delay and retry count for waiting completion of ERA command with 50 ms of
@@ -413,6 +423,62 @@ static int pinnacle_set_edge_sensitivity(const struct device *dev)
 	}
 
 	/* Clear SW_CC after the ERA writes */
+	return pinnacle_clear_cmd_complete(dev);
+}
+
+/*
+ * Force a recalibration of the compensation matrix. The ASIC calibrates once
+ * at power-on; if a finger is resting on the pad at that moment, or if the
+ * capacitive baseline drifts under a sustained touch, the stale baseline
+ * shows up as a jumpy cursor until the next no-touch recalibration. Doing it
+ * explicitly at the end of configuration makes the baseline reflect the
+ * settings just written (ADC attenuation and the per-axis Z minimums).
+ */
+static int pinnacle_force_recalibrate(const struct device *dev)
+{
+	uint8_t value;
+	int rc;
+	bool ret;
+
+	rc = pinnacle_read(dev, PINNACLE_REG_CAL_CONFIG1, &value);
+	if (rc) {
+		return rc;
+	}
+
+	value |= PINNACLE_CAL_CONFIG1_CALIBRATE;
+
+	rc = pinnacle_write(dev, PINNACLE_REG_CAL_CONFIG1, value);
+	if (rc) {
+		return rc;
+	}
+
+	/* The CALIBRATE bit is self-clearing once the calibration completes */
+	ret = WAIT_FOR(pinnacle_read(dev, PINNACLE_REG_CAL_CONFIG1, &value) == 0 &&
+		       (value & PINNACLE_CAL_CONFIG1_CALIBRATE) == 0,
+		       PINNACLE_RECALIBRATION_AWAIT_RETRY_COUNT *
+		       PINNACLE_RECALIBRATION_AWAIT_DELAY_POLL_US,
+		       k_sleep(K_USEC(PINNACLE_RECALIBRATION_AWAIT_DELAY_POLL_US)));
+	if (!ret) {
+		return -EIO;
+	}
+
+	/*
+	 * Wait for SW_CC to assert before clearing it. CALIBRATE reading back 0
+	 * is not ordered against SW_CC latching in STATUS1; clearing STATUS1
+	 * too early can leave a late-asserting SW_CC latched forever, which
+	 * holds HW_DR high so an edge-triggered data-ready interrupt never
+	 * fires again.
+	 */
+	ret = WAIT_FOR(pinnacle_read(dev, PINNACLE_REG_STATUS1, &value) == 0 &&
+		       (value & PINNACLE_STATUS1_SW_CC) == PINNACLE_STATUS1_SW_CC,
+		       PINNACLE_RECALIBRATION_AWAIT_RETRY_COUNT *
+		       PINNACLE_RECALIBRATION_AWAIT_DELAY_POLL_US,
+		       k_sleep(K_USEC(PINNACLE_RECALIBRATION_AWAIT_DELAY_POLL_US)));
+	if (!ret) {
+		return -EIO;
+	}
+
+	/* Clear SW_CC asserted by the calibration */
 	return pinnacle_clear_cmd_complete(dev);
 }
 
@@ -882,6 +948,13 @@ static int pinnacle_init(const struct device *dev)
 		return -EIO;
 	}
 
+	/* Recalibrate against the sensitivity settings just written */
+	rc = pinnacle_force_recalibrate(dev);
+	if (rc) {
+		LOG_ERR("Failed to force recalibration");
+		return -EIO;
+	}
+
 	value = 0x00;
 	if (config->sleep_mode_enable) {
 		value |= PINNACLE_SYS_CONFIG1_LOW_POWER_MODE;
@@ -947,6 +1020,26 @@ static int pinnacle_init(const struct device *dev)
 	if (rc) {
 		LOG_ERR("Failed to initialize interrupts");
 		return rc;
+	}
+
+	/*
+	 * The data-ready interrupt is edge-triggered, so a status bit that
+	 * latched between the last STATUS1 clear and the interrupt setup above
+	 * would hold HW_DR high forever with no edge to catch. If HW_DR is
+	 * already active, clear STATUS1 once more so the next data-ready
+	 * produces a clean rising edge; at most one stale frame is lost.
+	 */
+	rc = gpio_pin_get_dt(&config->dr_gpio);
+	if (rc < 0) {
+		LOG_ERR("Failed to read HW_DR level (%d)", rc);
+		return rc;
+	}
+	if (rc > 0) {
+		rc = pinnacle_write(dev, PINNACLE_REG_STATUS1, 0);
+		if (rc) {
+			LOG_ERR("Failed to clear stale HW_DR");
+			return rc;
+		}
 	}
 
 	return 0;
