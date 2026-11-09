@@ -7,8 +7,9 @@
  * separately-committed patches listed in the branch history: dropping
  * suspicious Status1 reads (and clearing Status1 on that path when the
  * data-ready line is left asserted), per-axis edge sensitivity, a forced
- * recalibration at the end of init, and clearing SW_CC only once it has
- * latched after each ERA access and the recalibration.
+ * recalibration at the end of init, clearing SW_CC only once it has
+ * latched after each ERA access and the recalibration, and a build-time
+ * range check on x-axis-z-min / y-axis-z-min.
  */
 /*
  * Copyright (c) 2024 Ilia Kharin
@@ -1150,6 +1151,12 @@ static int pinnacle_init(const struct device *dev)
 		     "active-range-x-min must be less than active-range-x-max");                   \
 	BUILD_ASSERT(DT_INST_PROP(inst, active_range_y_min) <                                      \
 			     DT_INST_PROP(inst, active_range_y_max),                               \
-		     "active_range-y-min must be less than active_range-y-max");
+		     "active_range-y-min must be less than active_range-y-max");                   \
+	BUILD_ASSERT(DT_INST_PROP(inst, x_axis_z_min) >= 0 &&                                      \
+			     DT_INST_PROP(inst, x_axis_z_min) <= UINT8_MAX,                        \
+		     "x-axis-z-min must be between 0 and 255");                                    \
+	BUILD_ASSERT(DT_INST_PROP(inst, y_axis_z_min) >= 0 &&                                      \
+			     DT_INST_PROP(inst, y_axis_z_min) <= UINT8_MAX,                        \
+		     "y-axis-z-min must be between 0 and 255");
 
 DT_INST_FOREACH_STATUS_OKAY(PINNACLE_DEFINE)
