@@ -4,7 +4,10 @@
  *
  * Local changes are limited to what is mechanically required to build
  * out-of-tree against Zephyr 3.5 (see the two shims below), plus the
- * separately-committed patches listed in the branch history.
+ * separately-committed patches listed in the branch history: dropping
+ * suspicious Status1 reads (and clearing Status1 on that path when the
+ * data-ready line is left asserted), per-axis edge sensitivity, and a
+ * forced recalibration at the end of init.
  */
 /*
  * Copyright (c) 2024 Ilia Kharin
@@ -731,6 +734,42 @@ static void pinnacle_scale_sample(const struct device *dev, union pinnacle_sampl
 				   config->resolution_y / range_y);
 }
 
+/*
+ * Called when a frame is dropped without the Status1 clear that normally
+ * follows a read. HW_DR is the OR of SW_DR and SW_CC, and the data-ready
+ * interrupt is edge-triggered: a status bit left latched holds the line
+ * high, no further edge arrives and the pad goes silent until a power
+ * cycle. So if the line still reads active, clear Status1 to bring it
+ * down; the next sample then produces a fresh edge.
+ *
+ * The line level, not the Status1 value just read, decides: after an
+ * all-ones read that value says nothing about the real register, and the
+ * line is the one thing that tells whether anything is stranded. With the
+ * line low nothing is written, so a flaky bus gets no extra traffic and
+ * no sample is discarded; with it high the clear costs at most the one
+ * sample that may have latched since the read, which a stranded line
+ * would cost every sample after it.
+ */
+static void pinnacle_release_stuck_data_ready(const struct device *dev)
+{
+	const struct pinnacle_config *config = dev->config;
+	int rc;
+
+	rc = gpio_pin_get_dt(&config->dr_gpio);
+	if (rc < 0) {
+		LOG_WRN("Failed to read HW_DR level (%d)", rc);
+		return;
+	}
+	if (rc == 0) {
+		return;
+	}
+
+	rc = pinnacle_write(dev, PINNACLE_REG_STATUS1, 0x00);
+	if (rc) {
+		LOG_WRN("Failed to clear Status1 after a dropped frame (%d)", rc);
+	}
+}
+
 static int pinnacle_sample_fetch(const struct device *dev, union pinnacle_sample *sample)
 {
 	const struct pinnacle_config *config = dev->config;
@@ -753,6 +792,7 @@ static int pinnacle_sample_fetch(const struct device *dev, union pinnacle_sample
 	 */
 	if (status == 0xFF || (status & PINNACLE_STATUS1_SW_DR) == 0) {
 		LOG_DBG("Ignoring suspicious Status1 value 0x%02x", status);
+		pinnacle_release_stuck_data_ready(dev);
 		return -EAGAIN;
 	}
 
