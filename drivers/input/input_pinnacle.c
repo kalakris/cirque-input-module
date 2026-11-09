@@ -6,8 +6,9 @@
  * out-of-tree against Zephyr 3.5 (see the two shims below), plus the
  * separately-committed patches listed in the branch history: dropping
  * suspicious Status1 reads (and clearing Status1 on that path when the
- * data-ready line is left asserted), per-axis edge sensitivity, and a
- * forced recalibration at the end of init.
+ * data-ready line is left asserted), per-axis edge sensitivity, a forced
+ * recalibration at the end of init, and clearing SW_CC only once it has
+ * latched after each ERA access and the recalibration.
  */
 /*
  * Copyright (c) 2024 Ilia Kharin
@@ -292,6 +293,39 @@ static inline int pinnacle_clear_cmd_complete(const struct device *dev)
 	return config->bus.write(&config->bus, PINNACLE_REG_STATUS1, 0x00);
 }
 
+/*
+ * Clear SW_CC once the command that asserts it has latched it. A command's
+ * own completion signal (CALIBRATE self-clearing, ERA_CTRL reading back
+ * complete) is not ordered against SW_CC latching in Status1, and a clear
+ * that lands before the latch leaves SW_CC set for good: HW_DR then stays
+ * high and the edge-triggered data-ready interrupt never fires. So wait,
+ * bounded, for SW_CC to assert first.
+ *
+ * A wait that times out is not fatal: the command itself completed, and
+ * failing init would leave the pad dead for certain. Status1 is cleared
+ * anyway, and the HW_DR check at the end of init catches a bit that
+ * latches later still.
+ */
+static int pinnacle_clear_cmd_complete_latched(const struct device *dev, const char *command,
+					       uint32_t timeout_us, uint32_t poll_us)
+{
+	uint8_t value;
+	bool ret;
+
+	ret = WAIT_FOR(pinnacle_read(dev, PINNACLE_REG_STATUS1, &value) == 0 &&
+		       (value & PINNACLE_STATUS1_SW_CC) == PINNACLE_STATUS1_SW_CC,
+		       timeout_us, k_sleep(K_USEC(poll_us)));
+	if (!ret) {
+		LOG_WRN("SW_CC did not assert after %s; clearing Status1 anyway", command);
+	}
+
+	return pinnacle_clear_cmd_complete(dev);
+}
+
+/*
+ * Wait for an ERA operation to complete, then clear the SW_CC it asserts,
+ * so that every ERA access leaves Status1 clear behind it.
+ */
 static int pinnacle_era_wait_for_completion(const struct device *dev)
 {
 	bool ret;
@@ -305,7 +339,9 @@ static int pinnacle_era_wait_for_completion(const struct device *dev)
 		return -EIO;
 	}
 
-	return 0;
+	return pinnacle_clear_cmd_complete_latched(
+		dev, "an ERA access", PINNACLE_ERA_AWAIT_RETRY_COUNT * PINNACLE_ERA_AWAIT_DELAY_POLL_US,
+		PINNACLE_ERA_AWAIT_DELAY_POLL_US);
 }
 
 static int pinnacle_era_write(const struct device *dev, uint16_t address, uint8_t value)
@@ -389,18 +425,8 @@ static int pinnacle_set_sensitivity(const struct device *dev)
 		break;
 	}
 
-	rc = pinnacle_era_write(dev, PINNACLE_ERA_REG_CONFIG, value);
-	if (rc) {
-		return rc;
-	}
-
-	/* Clear SW_CC after setting sensitivity */
-	rc = pinnacle_clear_cmd_complete(dev);
-	if (rc) {
-		return rc;
-	}
-
-	return 0;
+	/* The ERA write also clears the SW_CC it asserts */
+	return pinnacle_era_write(dev, PINNACLE_ERA_REG_CONFIG, value);
 }
 
 /*
@@ -420,13 +446,7 @@ static int pinnacle_set_edge_sensitivity(const struct device *dev)
 		return rc;
 	}
 
-	rc = pinnacle_era_write(dev, PINNACLE_ERA_REG_Y_AXIS_WIDE_Z_MIN, config->y_axis_z_min);
-	if (rc) {
-		return rc;
-	}
-
-	/* Clear SW_CC after the ERA writes */
-	return pinnacle_clear_cmd_complete(dev);
+	return pinnacle_era_write(dev, PINNACLE_ERA_REG_Y_AXIS_WIDE_Z_MIN, config->y_axis_z_min);
 }
 
 /*
@@ -465,24 +485,10 @@ static int pinnacle_force_recalibrate(const struct device *dev)
 		return -EIO;
 	}
 
-	/*
-	 * Wait for SW_CC to assert before clearing it. CALIBRATE reading back 0
-	 * is not ordered against SW_CC latching in STATUS1; clearing STATUS1
-	 * too early can leave a late-asserting SW_CC latched forever, which
-	 * holds HW_DR high so an edge-triggered data-ready interrupt never
-	 * fires again.
-	 */
-	ret = WAIT_FOR(pinnacle_read(dev, PINNACLE_REG_STATUS1, &value) == 0 &&
-		       (value & PINNACLE_STATUS1_SW_CC) == PINNACLE_STATUS1_SW_CC,
-		       PINNACLE_RECALIBRATION_AWAIT_RETRY_COUNT *
-		       PINNACLE_RECALIBRATION_AWAIT_DELAY_POLL_US,
-		       k_sleep(K_USEC(PINNACLE_RECALIBRATION_AWAIT_DELAY_POLL_US)));
-	if (!ret) {
-		return -EIO;
-	}
-
-	/* Clear SW_CC asserted by the calibration */
-	return pinnacle_clear_cmd_complete(dev);
+	return pinnacle_clear_cmd_complete_latched(dev, "the forced recalibration",
+						   PINNACLE_RECALIBRATION_AWAIT_RETRY_COUNT *
+							   PINNACLE_RECALIBRATION_AWAIT_DELAY_POLL_US,
+						   PINNACLE_RECALIBRATION_AWAIT_DELAY_POLL_US);
 }
 
 #if DT_ANY_INST_ON_BUS_STATUS_OKAY(i2c)
