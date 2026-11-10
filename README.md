@@ -93,12 +93,20 @@ rest of a working configuration.
 
 - `drivers/input/input_pinnacle.c`: the upstream Zephyr driver, vendored
   verbatim from `zephyrproject-rtos/zephyr` (commit `27150c9d`), with two
-  build shims for Zephyr 3.5 and three small patches on top:
-  1. Ignore suspicious `0xFF` status reads and frames without new data.
+  build shims for Zephyr 3.5 and six small patches on top:
+  1. A status read of `0xFF`, or a frame without new data, is dropped
+     rather than reported as motion.
   2. Per-axis edge sensitivity (`x-axis-z-min`, `y-axis-z-min`).
-  3. A recalibration at the end of initialization.
+  3. The pad recalibrates at the end of initialization, at the
+     configured sensitivity.
+  4. A dropped frame never leaves the data-ready line stuck high, so the
+     pad keeps reporting.
+  5. The command-complete flag is cleared only after it has latched, and
+     a flag that latches late does not fail initialization.
+  6. `x-axis-z-min` and `y-axis-z-min` outside 0–255 fail the build
+     instead of being truncated.
 - `dts/bindings/`: the upstream devicetree bindings, plus the two
-  properties above.
+  properties in patch 2.
 
 The file header and the commit history list every local change.
 
@@ -109,7 +117,7 @@ The file header and the commit history list every local change.
 
 ## Credits
 
-The driver is Zephyr's, by the Zephyr contributors. The three patches
+The driver is Zephyr's, by the Zephyr contributors. Patches 1 to 3
 apply fixes and features from Pete Johanson's
 [cirque-input-module](https://github.com/petejohanson/cirque-input-module)
 to the upstream driver.
